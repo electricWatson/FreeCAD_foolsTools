@@ -1,0 +1,368 @@
+# -*- coding: utf-8 -*-
+"""
+EdgeKeeper - save selected edges by LOCATION, re-select them later.
+
+Works around the topological naming problem: edge names (Edge12 ...) can change
+when earlier features change, but edge positions usually do not.
+
+Workflow
+  1. Select the edges you want (in the 3D view). Click "Save selection" and give the set a name.
+  2. Later, open the Fillet (or Chamfer) task dialog, leave the EdgeKeeper window open,
+     choose the set and click "Restore selection". The edges are added to the 3D selection
+     (and so to the Fillet dialog's list).
+
+Matching
+  - Default: each saved edge is matched to the single closest edge whose midpoint lies within
+    the tolerance (length is used as a tie-breaker).
+  - "Volume mode": every edge whose midpoint lies inside the tolerance sphere around each
+    saved point gets selected.
+
+Data is stored as a hidden JSON string property ("EdgeLocationSets") on the Body
+(or on the object itself if there is no Body), so it is saved with the .FCStd file.
+Coordinates are stored in global space - if you move the whole Body, re-save the set.
+"""
+
+import json
+import FreeCAD as App
+import FreeCADGui as Gui
+from FreeCAD import Vector
+
+try:
+    from PySide import QtGui, QtCore
+    try:
+        from PySide import QtWidgets
+    except ImportError:
+        QtWidgets = QtGui
+except ImportError:
+    from PySide2 import QtGui, QtCore, QtWidgets
+
+PROP = "EdgeLocationSets"
+
+
+# --------------------------------------------------------------------------- helpers
+def edge_mid(edge):
+    return edge.valueAt((edge.FirstParameter + edge.LastParameter) / 2.0)
+
+
+def owner_of(obj):
+    """Body that owns obj, or obj itself."""
+    if obj.TypeId == "PartDesign::Body":
+        return obj
+    for o in obj.InList:
+        if o.TypeId == "PartDesign::Body" and obj in o.Group:
+            return o
+    return obj
+
+
+def load_sets(owner):
+    if not hasattr(owner, PROP):
+        return {}
+    try:
+        return json.loads(getattr(owner, PROP) or "{}")
+    except Exception:
+        return {}
+
+
+def store_sets(owner, sets):
+    if not hasattr(owner, PROP):
+        owner.addProperty("App::PropertyString", PROP, "EdgeKeeper",
+                          "Saved edge locations (JSON)")
+        try:
+            owner.setEditorMode(PROP, 2)  # hide in property editor
+        except Exception:
+            pass
+    setattr(owner, PROP, json.dumps(sets))
+
+
+def selected_edges():
+    """List of (feature_object, 'EdgeN', edge_shape) from the current GUI selection."""
+    out = []
+    for s in Gui.Selection.getSelectionEx():
+        for sub in s.SubElementNames:
+            parts = sub.split(".")
+            last = parts[-1]
+            if not last.startswith("Edge"):
+                continue
+            feat = s.Object
+            if len(parts) > 1:
+                o = s.Document.getObject(parts[-2])
+                if o is not None and hasattr(o, "Shape"):
+                    feat = o
+            try:
+                edge = feat.Shape.getElement(last)
+            except Exception:
+                continue
+            out.append((feat, last, edge))
+    return out
+
+
+def signature(edge):
+    m = edge_mid(edge)
+    try:
+        ctype = edge.Curve.__class__.__name__
+    except Exception:
+        ctype = "?"
+    return {"mid": [m.x, m.y, m.z], "len": edge.Length, "type": ctype}
+
+
+def current_context():
+    """Return (owner, base_feature) for restoring.
+
+    Priority: object being edited (a Fillet/Chamfer -> its BaseFeature),
+    then the active Body's Tip (stepping back over a dress-up).
+    """
+    doc = App.ActiveDocument
+    if doc is None:
+        return None, None
+    edit_obj = None
+    try:
+        vp = Gui.ActiveDocument.getInEdit()
+        if vp is not None:
+            edit_obj = vp.Object
+    except Exception:
+        pass
+
+    body = None
+    try:
+        body = Gui.ActiveDocument.ActiveView.getActiveObject("pdbody")
+    except Exception:
+        pass
+
+    if edit_obj is not None:
+        body = owner_of(edit_obj) if owner_of(edit_obj).TypeId == "PartDesign::Body" else body
+        feat = edit_obj
+        if feat.isDerivedFrom("PartDesign::DressUp") and getattr(feat, "BaseFeature", None):
+            feat = feat.BaseFeature
+        return (body or owner_of(feat)), feat
+
+    if body is not None:
+        feat = body.Tip
+        if feat is not None and feat.isDerivedFrom("PartDesign::DressUp") \
+                and getattr(feat, "BaseFeature", None):
+            feat = feat.BaseFeature
+        return body, feat
+
+    # No body: fall back to a single selected object
+    sel = Gui.Selection.getSelection()
+    if sel:
+        return owner_of(sel[0]), sel[0]
+    return None, None
+
+
+def body_features(body):
+    """Solid-producing features of a Body, in tree order."""
+    if body is None or body.TypeId != "PartDesign::Body":
+        return []
+    return [o for o in body.Group if o.isDerivedFrom("PartDesign::Feature")]
+
+
+def find_matches(shape, sigs, tol, volume_mode, use_len):
+    edges = shape.Edges
+    mids = [edge_mid(e) for e in edges]
+    chosen = []
+    missing = 0
+    for sig in sigs:
+        p = Vector(*sig["mid"])
+        cands = []
+        for i, (e, m) in enumerate(zip(edges, mids)):
+            d = (m - p).Length
+            if d > tol:
+                continue
+            ld = abs(e.Length - sig["len"])
+            if use_len and ld > max(tol, 0.02 * sig["len"]):
+                continue
+            cands.append((d + 0.1 * ld, i))
+        if not cands:
+            missing += 1
+            continue
+        cands.sort()
+        if volume_mode:
+            for _, i in cands:
+                if i not in chosen:
+                    chosen.append(i)
+        else:
+            for _, i in cands:
+                if i not in chosen:
+                    chosen.append(i)
+                    break
+    return ["Edge%d" % (i + 1) for i in chosen], missing
+
+
+def add_to_selection(owner, feat, names):
+    doc = feat.Document
+    n = 0
+    for name in names:
+        try:
+            if owner is not None and owner.TypeId == "PartDesign::Body" and owner is not feat:
+                Gui.Selection.addSelection(doc.Name, owner.Name, "%s.%s" % (feat.Name, name))
+            else:
+                Gui.Selection.addSelection(doc.Name, feat.Name, name)
+            n += 1
+        except Exception as ex:
+            App.Console.PrintWarning("EdgeKeeper: could not select %s: %s\n" % (name, ex))
+    return n
+
+
+# --------------------------------------------------------------------------- UI
+class EdgeKeeperDialog(QtWidgets.QDialog):
+    def __init__(self):
+        super().__init__(Gui.getMainWindow())
+        self.setWindowTitle("EdgeKeeper")
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Tool)
+        self.setMinimumWidth(340)
+        lay = QtWidgets.QVBoxLayout(self)
+
+        lay.addWidget(QtWidgets.QLabel("Edge set name:"))
+        self.combo = QtWidgets.QComboBox()
+        self.combo.setEditable(True)
+        lay.addWidget(self.combo)
+
+        row = QtWidgets.QHBoxLayout()
+        b_save = QtWidgets.QPushButton("Save selection")
+        b_add = QtWidgets.QPushButton("Add to set")
+        b_del = QtWidgets.QPushButton("Delete set")
+        for b in (b_save, b_add, b_del):
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        lay.addWidget(QtWidgets.QLabel("Target feature to select edges on:"))
+        self.target = QtWidgets.QComboBox()
+        lay.addWidget(self.target)
+
+        trow = QtWidgets.QHBoxLayout()
+        trow.addWidget(QtWidgets.QLabel("Tolerance / radius (mm):"))
+        self.tol = QtWidgets.QDoubleSpinBox()
+        self.tol.setDecimals(3)
+        self.tol.setRange(0.001, 10000.0)
+        self.tol.setValue(0.5)
+        trow.addWidget(self.tol)
+        lay.addLayout(trow)
+
+        self.chk_vol = QtWidgets.QCheckBox("Volume mode: select ALL edges inside each sphere")
+        self.chk_len = QtWidgets.QCheckBox("Require similar edge length")
+        self.chk_clear = QtWidgets.QCheckBox("Clear current selection first")
+        self.chk_clear.setChecked(True)
+        for c in (self.chk_vol, self.chk_len, self.chk_clear):
+            lay.addWidget(c)
+
+        b_rest = QtWidgets.QPushButton("Restore selection")
+        b_rest.setStyleSheet("font-weight: bold;")
+        lay.addWidget(b_rest)
+
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        b_save.clicked.connect(lambda: self.save(append=False))
+        b_add.clicked.connect(lambda: self.save(append=True))
+        b_del.clicked.connect(self.delete)
+        b_rest.clicked.connect(self.restore)
+        self.refresh_sets()
+
+    # -- bookkeeping
+    def msg(self, text):
+        self.status.setText(text)
+        App.Console.PrintMessage("EdgeKeeper: %s\n" % text)
+
+    def refresh_sets(self, select=None):
+        owner, _ = current_context()
+        names = sorted(load_sets(owner).keys()) if owner is not None else []
+        self.combo.clear()
+        self.combo.addItems(names)
+        if select:
+            self.combo.setCurrentText(select)
+        self.refresh_targets()
+
+    def refresh_targets(self):
+        keep = self.target.currentData()
+        owner, auto_feat = current_context()
+        self.target.clear()
+        auto_label = "Auto (%s)" % auto_feat.Label if auto_feat is not None else "Auto"
+        self.target.addItem(auto_label, None)
+        for f in body_features(owner):
+            self.target.addItem(f.Label, f.Name)
+        if keep:
+            i = self.target.findData(keep)
+            if i >= 0:
+                self.target.setCurrentIndex(i)
+
+    def showEvent(self, e):
+        self.refresh_sets()
+        super().showEvent(e)
+
+    # -- actions
+    def save(self, append):
+        name = self.combo.currentText().strip()
+        if not name:
+            self.msg("Enter a set name first.")
+            return
+        edges = selected_edges()
+        if not edges:
+            self.msg("No edges are selected.")
+            return
+        owner = owner_of(edges[0][0])
+        sets = load_sets(owner)
+        sigs = [signature(e) for _, _, e in edges]
+        if append and name in sets:
+            existing = sets[name]["edges"]
+            added = 0
+            for sg in sigs:
+                p = Vector(*sg["mid"])
+                dup = any((Vector(*ex["mid"]) - p).Length < 1e-4
+                          and abs(ex["len"] - sg["len"]) < 1e-4 for ex in existing)
+                if not dup:
+                    existing.append(sg)
+                    added += 1
+            sigs = sigs[:added] if added else []
+        else:
+            sets[name] = {"edges": sigs}
+        store_sets(owner, sets)
+        self.refresh_sets(select=name)
+        self.msg("Saved %d edge(s) in set '%s' (now %d total) on %s."
+                 % (len(sigs), name, len(sets[name]["edges"]), owner.Label))
+
+    def delete(self):
+        name = self.combo.currentText().strip()
+        owner, _ = current_context()
+        if owner is None:
+            return
+        sets = load_sets(owner)
+        if name in sets:
+            del sets[name]
+            store_sets(owner, sets)
+            self.refresh_sets()
+            self.msg("Deleted set '%s'." % name)
+
+    def restore(self):
+        name = self.combo.currentText().strip()
+        owner, feat = current_context()
+        chosen = self.target.currentData()
+        if chosen:  # user picked a specific feature
+            picked = App.ActiveDocument.getObject(chosen)
+            if picked is not None:
+                feat = picked
+        if owner is None or feat is None:
+            self.msg("Could not work out which feature to search. Activate the Body first.")
+            return
+        sets = load_sets(owner)
+        if name not in sets:
+            self.msg("No set called '%s' on %s." % (name, owner.Label))
+            return
+        try:
+            shape = feat.Shape
+            if shape.isNull():
+                raise ValueError("empty shape")
+        except Exception:
+            self.msg("Feature '%s' has no usable shape." % feat.Label)
+            return
+        names, missing = find_matches(shape, sets[name]["edges"], self.tol.value(),
+                                      self.chk_vol.isChecked(), self.chk_len.isChecked())
+        if self.chk_clear.isChecked():
+            Gui.Selection.clearSelection()
+        n = add_to_selection(owner, feat, names)
+        self.msg("Selected %d edge(s) on '%s'; %d saved location(s) had no match "
+                 "(try a larger tolerance)." % (n, feat.Label, missing))
+
+
+_dlg = EdgeKeeperDialog()
+_dlg.show()
